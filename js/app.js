@@ -57,6 +57,7 @@ const S = {
   edit: null,
   setup: null,
   confirm: null,
+  renames: {},
   busy: false,
 };
 let unsubs = [];
@@ -262,6 +263,7 @@ async function addPlayer() {
   const existing = Object.entries(S.players).find(([, p]) => p.name.toLowerCase() === name.toLowerCase());
   const id = existing ? existing[0] : G.uid("p");
   if (!existing) await S.store.set("players", id, { name, createdAt: Date.now() });
+  else if (existing[1].hidden) await S.store.set("players", id, { ...existing[1], hidden: false });
   if (!S.setup.selected.includes(id)) S.setup.selected.push(id);
   S.setup.newName = "";
   render();
@@ -290,6 +292,7 @@ function header() {
       <div class="sub"><b>${esc(S.meta?.name || "Table")}</b><span>Code <span class="code">${esc(S.room)}</span></span><span>${esc(S.store?.label)}</span></div></div>
     <div class="tools">
       ${S.screen !== "games" ? `<button class="chipbtn" data-act="games">All games</button>` : ""}
+      ${S.keeper && S.screen !== "players" ? `<button class="chipbtn" data-act="players">Players</button>` : ""}
       ${S.keeper ? `<button class="chipbtn on" data-act="lock" aria-pressed="true">Scorekeeper on</button>` : `<button class="chipbtn" data-act="pin">Scorekeeper</button>`}
       <button class="chipbtn" data-act="copy">Share code</button>
       <button class="chipbtn" data-act="leave">Leave</button>
@@ -346,7 +349,7 @@ function gamesView() {
 function setupView() {
   const su = S.setup;
   const set = PRESETS.find((p) => p.id === su.setId);
-  const known = Object.entries(S.players).sort((a, b) => a[1].name.localeCompare(b[1].name));
+  const known = Object.entries(S.players).filter(([, p]) => !p.hidden).sort((a, b) => a[1].name.localeCompare(b[1].name));
   const picks = known.map(([id, p]) => `<button type="button" data-act="pick" data-id="${esc(id)}" aria-pressed="${su.selected.includes(id)}">${esc(p.name)}</button>`).join("");
   const seats = su.selected.map((id, i) => `<div class="seat" style="--c:${color(i)}"><span class="dot"></span><span>${i + 1}. ${esc(pname(id))}${i === 0 ? " · deals first" : ""}</span>
     <button type="button" data-act="seat-up" data-i="${i}" aria-label="Move up" ${i ? "" : "disabled"}>↑</button>
@@ -370,6 +373,48 @@ function setupView() {
   </section>
   <div class="row"><button class="btn" data-act="start-game" ${su.selected.length >= 2 && su.selected.length <= 6 && Number(su.start) <= Number(su.end) ? "" : "disabled"}>Start game</button>
     <button class="btn ghost" data-act="games">Cancel</button></div>`;
+}
+
+function playersView() {
+  const games = Object.values(S.games);
+  const list = Object.entries(S.players).filter(([, p]) => !p.hidden).sort((a, b) => a[1].name.localeCompare(b[1].name));
+  const rows = list.map(([id, p]) => {
+    const used = games.filter((g) => g.playerIds.includes(id));
+    const live = used.filter((g) => g.status === "playing").length;
+    const val = S.renames[id] ?? p.name;
+    const confirming = S.confirm?.pid === id;
+    return `<form class="prow" style="--c:var(--accent)" data-form="rename" data-id="${esc(id)}">
+      <div class="row" style="flex-wrap:nowrap"><input id="pn-${esc(id)}" class="input" maxlength="20" data-bind="renames.${esc(id)}" data-rerender="1" value="${esc(val)}" aria-label="Name"></div>
+      <div class="row" style="gap:6px"><button class="btn small" ${val.trim() && val.trim() !== p.name ? "" : "disabled"}>Save</button>
+        <button type="button" class="btn small ghost" data-act="remove-player" data-pid="${esc(id)}" ${live ? "disabled" : ""}>Remove</button></div>
+      <div class="st" style="grid-column:1/-1">${used.length ? `In ${used.length} game${used.length > 1 ? "s" : ""}${live ? ", including one in progress, so it can't be removed" : ""}` : "Not in any games"}</div>
+      ${confirming ? `<div class="confirm" style="grid-column:1/-1"><span>Remove ${esc(p.name)} from the player list? Past games keep their scores.</span><button type="button" class="btn danger small" data-act="confirm">Remove</button><button type="button" class="btn ghost small" data-act="cancel">Cancel</button></div>` : ""}
+    </form>`;
+  }).join("");
+  return `${header()}
+    <section class="card"><h2>Players</h2>
+      <p class="hint">Fix a name and tap Save; the change shows everywhere, including past games. Remove takes a player off the list for new games.</p>
+      ${rows ? `<div class="plist">${rows}</div>` : `<p class="hint">No players yet. Add them when you set up a new game.</p>`}</section>`;
+}
+
+async function renamePlayer(id) {
+  const p = S.players[id];
+  const name = (S.renames[id] || "").trim().slice(0, 20);
+  if (!p || !name) return;
+  const clash = Object.entries(S.players).find(([k, x]) => k !== id && !x.hidden && x.name.toLowerCase() === name.toLowerCase());
+  if (clash) return toast(`There's already a player named ${clash[1].name}.`);
+  await S.store.set("players", id, { ...p, name });
+  delete S.renames[id];
+  toast("Name updated");
+  render();
+}
+async function removePlayer(id) {
+  const p = S.players[id];
+  if (!p) return;
+  if (Object.values(S.games).some((g) => g.status === "playing" && g.playerIds.includes(id))) return toast("That player is in a game in progress.");
+  await S.store.set("players", id, { ...p, hidden: true });
+  toast(`${p.name} removed`);
+  render();
 }
 
 function gameView() {
@@ -496,7 +541,7 @@ function render() {
   const active = document.activeElement;
   const focusId = active && app.contains(active) && active.id ? active.id : null;
   const sel = focusId && "selectionStart" in active ? [active.selectionStart, active.selectionEnd] : null;
-  const html = S.screen === "home" ? homeView() : S.screen === "setup" ? setupView() : S.screen === "game" ? gameView() : gamesView();
+  const html = S.screen === "home" ? homeView() : S.screen === "setup" ? setupView() : S.screen === "game" ? gameView() : S.screen === "players" ? playersView() : gamesView();
   app.innerHTML = html;
   if (focusId) {
     const el = document.getElementById(focusId);
@@ -548,6 +593,7 @@ document.addEventListener("submit", (ev) => {
   else if (f === "pin") unlockKeeper();
   else if (f === "add-player") addPlayer();
   else if (f === "edit") saveEdit();
+  else if (f === "rename") renamePlayer(ev.target.dataset.id);
 });
 
 document.addEventListener("click", async (ev) => {
@@ -559,6 +605,8 @@ document.addEventListener("click", async (ev) => {
     case "games": S.setup = null; openGames(); break;
     case "open": openGame(id); break;
     case "new": openSetup(); break;
+    case "players": Object.assign(S, { screen: "players", gameId: null, confirm: null, renames: {} }); render(); break;
+    case "remove-player": S.confirm = { pid, run: () => removePlayer(pid) }; render(); break;
     case "leave": leaveTable(); break;
     case "copy":
       try { await navigator.clipboard.writeText(S.room); toast(`Copied code ${S.room}`); } catch { toast(`Table code: ${S.room}`); }
